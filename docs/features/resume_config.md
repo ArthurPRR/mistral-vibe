@@ -147,13 +147,70 @@ Shape clashes (e.g. `mcp_servers` written as a table instead of `[[mcp_servers]]
 2. else the **project** layer if it is trusted;
 3. else the **overrides** layer (ephemeral).
 
-### 3.4 `EventBus` (`event_bus.py`)
+### 3.4 `EventBus` (`event_bus.py`) — the publisher/subscriber channel
 
-Publish/subscribe for `ConfigChangeEvent(changed_keys, before, after, reason)`.
+Change notification in the config system is a small **in-process pub/sub bus** owned by the orchestrator: the orchestrator publishes, subscribers register with optional key filters.
 
-- `subscribe(callback, *, keys=None) -> unsubscribe`
-- `publish(event)` (not `emit`)
-- `keys` are slash-separated paths; a key matches itself, its ancestors and its descendants (`"models"` matches `"models/models"`, but `"model"` never matches `"models"`). `None` = wildcard.
+**Event model** (`types.py`). The payload is a frozen dataclass:
+
+```python
+@dataclass(frozen=True, slots=True)
+class ConfigChangeEvent:
+    changed_keys: frozenset[str]  # slash-separated leaf paths that differ
+    before: dict[str, Any]        # full snapshot (model_dump(mode="json")) before the write
+    after: dict[str, Any]         # full snapshot after the write
+    reason: str                   # free-text cause, carried from the write call
+
+type ConfigChangeCallback = Callable[[ConfigChangeEvent], None]
+```
+
+**Bus mechanics** (`event_bus.py`):
+
+- Subscriptions live in a `dict[int, Subscription]` keyed by an `itertools.count()` id; `Subscription` is a frozen dataclass `(keys: frozenset[str] | None, callback)`.
+- `subscribe(callback, *, keys=None)` registers a listener and returns an `unsubscribe()` closure that pops its id (`dict.pop(id, None)` — safe to call twice).
+- `publish(event)` (not `emit`) iterates over `list(self._subscribers.values())` — a **snapshot copy** — so a callback that unsubscribes (itself or another subscriber) during delivery cannot corrupt the iteration. Delivery is **synchronous**, in registration order, on the publisher's task.
+
+**Key filtering.** `keys` are slash-separated config paths; a subscription fires when `_key_matches` matches any of its keys against any entry of `event.changed_keys`. Matching is segment-wise and bidirectional along the path:
+
+| subscription key | changed key | match? |
+|---|---|---|
+| `models` | `models/mistral/api_key` | yes (descendant) |
+| `models/mistral` | `models` | yes (ancestor) |
+| `model` | `models` | **no** — not a string prefix, only whole segments |
+| `models/mistral` | `models/llamacpp` | no (siblings) |
+
+`keys=None` is the wildcard: every event is delivered.
+
+**Who publishes, and when.** The orchestrator is the only publisher — `self._bus.publish(...)` appears exactly once, at the end of `apply_patch`:
+
+```mermaid
+sequenceDiagram
+    participant L as Target layer(s)
+    participant O as Orchestrator
+    participant B as EventBus
+    participant S as Subscribers
+    O->>L: apply patch per layer (parallel tasks)
+    O->>O: reload (force_load=True), swap snapshot
+    O->>O: changed_keys = diff(before, after)
+    alt at least one layer write succeeded AND changed_keys non-empty
+        O->>B: publish(ConfigChangeEvent)
+        B->>S: deliver to matching subscriptions
+    end
+```
+
+- `changed_keys` comes from `_changed_keys_between(before, after)`, a recursive diff over the two full JSON dumps: dicts are recursed key by key, and the first level where values differ is reported as one slash path. A changed nested field is therefore a leaf path (`tools/bash/timeout`), while a changed list is reported as a single key (`enabled_tools`).
+- **Only `apply_patch` publishes.** `reload()` and `rebuild()` swap the snapshot silently — an external edit to `config.toml` picked up by a reload never emits an event. Subscribers only learn about writes that went through the orchestrator.
+- A patch that changes nothing (empty `changed_keys`) or whose layer writes all failed publishes nothing.
+- `ConfigOrchestrator.subscribe(callback, keys=...)` is a thin delegate to the bus and returns the same unsubscribe callable.
+- `copy()` gives the copy a **fresh bus** (`bus=None`): the original's subscribers are not inherited.
+
+**Consumers across the app-server boundary.** Clients never touch the core bus (ADR 0005 / 0009). The app server exposes its own pub/sub in `ConfigResource` (`vibe/app_server/_runtime_resources.py`):
+
+- `subscribe(callback)` appends to a local list and returns an unsubscribe closure; `publish_change(previous)` is a **no-op when the view did not change** (`previous == self.current`) and otherwise calls every subscriber with the new `ConfigView`.
+- It is driven by `_apply_runtime(RuntimeSnapshot)`: when the server pushes a new runtime snapshot to the client, the resource applies it and publishes the change.
+- The Python TUI uses exactly this hook — `vibe/cli/textual_ui/app.py` subscribes `self._on_config_changed` at mount, which live-applies `theme`, `cursor_blink` and `log_level`, and refreshes the banner, context progress and subagent list.
+
+**Tests** (`tests/core/config/test_config_bus.py`, 7 tests): wildcard delivery, keyed filtering, bidirectional ancestor/descendant matching, partial-segment non-match, sibling non-match, unsubscribe stops delivery, unsubscribe-during-publish is safe.
 
 ---
 
@@ -278,7 +335,7 @@ Key properties:
 
 - Operations carry an optional `target_layer_name`; operations without one go to the default write target.
 - **Writes are not atomic across layers.** The preview is "a cheap sanity check only"; per-layer failures are *returned* as a list of exceptions, while an invalid patch shape raises `ConfigPatchValidationError`.
-- After the writes the orchestrator **always reloads** (`force_load=True`), then diffs `before`/`after` (`_changed_keys_between`) to build `changed_keys`.
+- After the writes the orchestrator **always reloads** (`force_load=True`), then diffs `before`/`after` (`_changed_keys_between`) to build `changed_keys`. The `ConfigChangeEvent` is published only when at least one layer write succeeded **and** `changed_keys` is non-empty; a bare `reload()` never publishes. See [3.4](#34-eventbus-event_buspy--the-publishersubscriber-channel) for the full publisher/subscriber semantics.
 - `mutate_field` (read-modify-write of one field under the lock) and `upsert_field` (insert-or-replace in a keyed list via `resolve_upsert_op`) are conveniences built on the same machinery.
 - `set_field_or_warn` exists because `set_field` *returns* errors; callers that ignore the return value could otherwise lose failures silently.
 
