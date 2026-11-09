@@ -26,7 +26,7 @@ Detailed report on how configuration works in `vibe/core/config`: layered archit
 
 ## 1. Overview
 
-Configuration is **layered, schema-driven and snapshot-based** (see [ADR 0005](../../../../adr/0005-layered-configuration.md)):
+Configuration is **layered, schema-driven and snapshot-based** (see [ADR 0005](../../../adr/0005-layered-configuration.md)):
 
 - Several **layers** (TOML files, env vars, in-memory dicts, remote experiments) each produce a *sparse* dictionary.
 - A **builder** merges them with an explicit **per-field merge strategy**, records which layer last contributed each field, and validates the result with Pydantic.
